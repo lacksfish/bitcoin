@@ -157,6 +157,28 @@ bool CheckFinalTxAtTip(const CBlockIndex& active_chain_tip, const CTransaction& 
     return IsFinalTx(tx, nBlockHeight, nBlockTime);
 }
 
+bool CheckFinalTxAtTipNoLocktime(const CBlockIndex& active_chain_tip, const CTransaction& tx)
+{
+    AssertLockHeld(cs_main);
+
+    // CheckFinalTxAtTip() uses active_chain_tip.Height()+1 to evaluate
+    // nLockTime because when IsFinalTx() is called within
+    // AcceptBlock(), the height of the block *being*
+    // evaluated is what is used. Thus if we want to know if a
+    // transaction can be part of the *next* block, we need to call
+    // IsFinalTx() with one more than active_chain_tip.Height().
+    const int nBlockHeight = active_chain_tip.nHeight + 1;
+
+    // BIP113 requires that time-locked transactions have nLockTime set to
+    // less than the median time of the previous block they're contained in.
+    // When the next block is created its previous block will be the current
+    // chain tip, so we use that to calculate the median time passed to
+    // IsFinalTx().
+    const int64_t nBlockTime{active_chain_tip.GetMedianTimePast()};
+
+    return IsFinalTxNoLocktime(tx, nBlockHeight, nBlockTime);
+}
+
 namespace {
 /**
  * A helper which calculates heights of inputs of a given transaction.
@@ -549,12 +571,22 @@ public:
     // Single transaction acceptance
     MempoolAcceptResult AcceptSingleTransaction(const CTransactionRef& ptx, ATMPArgs& args) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
 
+    // Single transaction acceptance
+    MempoolAcceptResult AcceptSingleTransactionNoLocktime(const CTransactionRef& ptx, ATMPArgs& args) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
+
     /**
     * Multiple transaction acceptance. Transactions may or may not be interdependent, but must not
     * conflict with each other, and the transactions cannot already be in the mempool. Parents must
     * come before children if any dependencies exist.
     */
     PackageMempoolAcceptResult AcceptMultipleTransactions(const std::vector<CTransactionRef>& txns, ATMPArgs& args) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
+
+    /**
+    * Multiple transaction acceptance. Transactions may or may not be interdependent, but must not
+    * conflict with each other, and the transactions cannot already be in the mempool. Parents must
+    * come before children if any dependencies exist.
+    */
+    PackageMempoolAcceptResult AcceptMultipleTransactionsNoLocktime(const std::vector<CTransactionRef>& txns, ATMPArgs& args) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
 
     /**
      * Package (more specific than just multiple transactions) acceptance. Package must be a child
@@ -615,6 +647,12 @@ private:
     // package limits, etc. As this function can be invoked for "free" by a peer,
     // only tests that are fast should be done here (to avoid CPU DoS).
     bool PreChecks(ATMPArgs& args, Workspace& ws) EXCLUSIVE_LOCKS_REQUIRED(cs_main, m_pool.cs);
+
+    // Run the policy checks on a given transaction, excluding any script checks.
+    // Looks up inputs, calculates feerate, considers replacement, evaluates
+    // package limits, etc. As this function can be invoked for "free" by a peer,
+    // only tests that are fast should be done here (to avoid CPU DoS).
+    bool PreChecksNoLocktime(ATMPArgs& args, Workspace& ws) EXCLUSIVE_LOCKS_REQUIRED(cs_main, m_pool.cs);
 
     // Run checks for mempool replace-by-fee.
     bool ReplacementChecks(Workspace& ws) EXCLUSIVE_LOCKS_REQUIRED(cs_main, m_pool.cs);
@@ -717,6 +755,258 @@ bool MemPoolAccept::PreChecks(ATMPArgs& args, Workspace& ws)
     // block; we don't want our mempool filled up with transactions that can't
     // be mined yet.
     if (!CheckFinalTxAtTip(*Assert(m_active_chainstate.m_chain.Tip()), tx)) {
+        return state.Invalid(TxValidationResult::TX_PREMATURE_SPEND, "non-final");
+    }
+
+    if (m_pool.exists(GenTxid::Wtxid(tx.GetWitnessHash()))) {
+        // Exact transaction already exists in the mempool.
+        return state.Invalid(TxValidationResult::TX_CONFLICT, "txn-already-in-mempool");
+    } else if (m_pool.exists(GenTxid::Txid(tx.GetHash()))) {
+        // Transaction with the same non-witness data but different witness (same txid, different
+        // wtxid) already exists in the mempool.
+        return state.Invalid(TxValidationResult::TX_CONFLICT, "txn-same-nonwitness-data-in-mempool");
+    }
+
+    // Check for conflicts with in-memory transactions
+    for (const CTxIn &txin : tx.vin)
+    {
+        const CTransaction* ptxConflicting = m_pool.GetConflictTx(txin.prevout);
+        if (ptxConflicting) {
+            if (!args.m_allow_replacement) {
+                // Transaction conflicts with a mempool tx, but we're not allowing replacements.
+                return state.Invalid(TxValidationResult::TX_MEMPOOL_POLICY, "bip125-replacement-disallowed");
+            }
+            if (!ws.m_conflicts.count(ptxConflicting->GetHash()))
+            {
+                // Transactions that don't explicitly signal replaceability are
+                // *not* replaceable with the current logic, even if one of their
+                // unconfirmed ancestors signals replaceability. This diverges
+                // from BIP125's inherited signaling description (see CVE-2021-31876).
+                // Applications relying on first-seen mempool behavior should
+                // check all unconfirmed ancestors; otherwise an opt-in ancestor
+                // might be replaced, causing removal of this descendant.
+                //
+                // If replaceability signaling is ignored due to node setting,
+                // replacement is always allowed.
+                if (!m_pool.m_full_rbf && !SignalsOptInRBF(*ptxConflicting)) {
+                    return state.Invalid(TxValidationResult::TX_MEMPOOL_POLICY, "txn-mempool-conflict");
+                }
+
+                ws.m_conflicts.insert(ptxConflicting->GetHash());
+            }
+        }
+    }
+
+    m_view.SetBackend(m_viewmempool);
+
+    const CCoinsViewCache& coins_cache = m_active_chainstate.CoinsTip();
+    // do all inputs exist?
+    for (const CTxIn& txin : tx.vin) {
+        if (!coins_cache.HaveCoinInCache(txin.prevout)) {
+            coins_to_uncache.push_back(txin.prevout);
+        }
+
+        // Note: this call may add txin.prevout to the coins cache
+        // (coins_cache.cacheCoins) by way of FetchCoin(). It should be removed
+        // later (via coins_to_uncache) if this tx turns out to be invalid.
+        if (!m_view.HaveCoin(txin.prevout)) {
+            // Are inputs missing because we already have the tx?
+            for (size_t out = 0; out < tx.vout.size(); out++) {
+                // Optimistically just do efficient check of cache for outputs
+                if (coins_cache.HaveCoinInCache(COutPoint(hash, out))) {
+                    return state.Invalid(TxValidationResult::TX_CONFLICT, "txn-already-known");
+                }
+            }
+            // Otherwise assume this might be an orphan tx for which we just haven't seen parents yet
+            return state.Invalid(TxValidationResult::TX_MISSING_INPUTS, "bad-txns-inputs-missingorspent");
+        }
+    }
+
+    // This is const, but calls into the back end CoinsViews. The CCoinsViewDB at the bottom of the
+    // hierarchy brings the best block into scope. See CCoinsViewDB::GetBestBlock().
+    m_view.GetBestBlock();
+
+    // we have all inputs cached now, so switch back to dummy (to protect
+    // against bugs where we pull more inputs from disk that miss being added
+    // to coins_to_uncache)
+    m_view.SetBackend(m_dummy);
+
+    assert(m_active_chainstate.m_blockman.LookupBlockIndex(m_view.GetBestBlock()) == m_active_chainstate.m_chain.Tip());
+
+    // Only accept BIP68 sequence locked transactions that can be mined in the next
+    // block; we don't want our mempool filled up with transactions that can't
+    // be mined yet.
+    // Pass in m_view which has all of the relevant inputs cached. Note that, since m_view's
+    // backend was removed, it no longer pulls coins from the mempool.
+    const std::optional<LockPoints> lock_points{CalculateLockPointsAtTip(m_active_chainstate.m_chain.Tip(), m_view, tx)};
+    if (!lock_points.has_value() || !CheckSequenceLocksAtTip(m_active_chainstate.m_chain.Tip(), *lock_points)) {
+        return state.Invalid(TxValidationResult::TX_PREMATURE_SPEND, "non-BIP68-final");
+    }
+
+    // The mempool holds txs for the next block, so pass height+1 to CheckTxInputs
+    if (!Consensus::CheckTxInputs(tx, state, m_view, m_active_chainstate.m_chain.Height() + 1, ws.m_base_fees)) {
+        return false; // state filled in by CheckTxInputs
+    }
+
+    if (m_pool.m_require_standard && !AreInputsStandard(tx, m_view)) {
+        return state.Invalid(TxValidationResult::TX_INPUTS_NOT_STANDARD, "bad-txns-nonstandard-inputs");
+    }
+
+    // Check for non-standard witnesses.
+    if (tx.HasWitness() && m_pool.m_require_standard && !IsWitnessStandard(tx, m_view)) {
+        return state.Invalid(TxValidationResult::TX_WITNESS_MUTATED, "bad-witness-nonstandard");
+    }
+
+    int64_t nSigOpsCost = GetTransactionSigOpCost(tx, m_view, STANDARD_SCRIPT_VERIFY_FLAGS);
+
+    // ws.m_modified_fees includes any fee deltas from PrioritiseTransaction
+    ws.m_modified_fees = ws.m_base_fees;
+    m_pool.ApplyDelta(hash, ws.m_modified_fees);
+
+    // Keep track of transactions that spend a coinbase, which we re-scan
+    // during reorgs to ensure COINBASE_MATURITY is still met.
+    bool fSpendsCoinbase = false;
+    for (const CTxIn &txin : tx.vin) {
+        const Coin &coin = m_view.AccessCoin(txin.prevout);
+        if (coin.IsCoinBase()) {
+            fSpendsCoinbase = true;
+            break;
+        }
+    }
+
+    entry.reset(new CTxMemPoolEntry(ptx, ws.m_base_fees, nAcceptTime, m_active_chainstate.m_chain.Height(),
+                                    fSpendsCoinbase, nSigOpsCost, lock_points.value()));
+    ws.m_vsize = entry->GetTxSize();
+
+    if (nSigOpsCost > MAX_STANDARD_TX_SIGOPS_COST)
+        return state.Invalid(TxValidationResult::TX_NOT_STANDARD, "bad-txns-too-many-sigops",
+                strprintf("%d", nSigOpsCost));
+
+    // No individual transactions are allowed below the min relay feerate and mempool min feerate except from
+    // disconnected blocks and transactions in a package. Package transactions will be checked using
+    // package feerate later.
+    if (!bypass_limits && !args.m_package_feerates && !CheckFeeRate(ws.m_vsize, ws.m_modified_fees, state)) return false;
+
+    ws.m_iters_conflicting = m_pool.GetIterSet(ws.m_conflicts);
+    // Calculate in-mempool ancestors, up to a limit.
+    if (ws.m_conflicts.size() == 1) {
+        // In general, when we receive an RBF transaction with mempool conflicts, we want to know whether we
+        // would meet the chain limits after the conflicts have been removed. However, there isn't a practical
+        // way to do this short of calculating the ancestor and descendant sets with an overlay cache of
+        // changed mempool entries. Due to both implementation and runtime complexity concerns, this isn't
+        // very realistic, thus we only ensure a limited set of transactions are RBF'able despite mempool
+        // conflicts here. Importantly, we need to ensure that some transactions which were accepted using
+        // the below carve-out are able to be RBF'ed, without impacting the security the carve-out provides
+        // for off-chain contract systems (see link in the comment below).
+        //
+        // Specifically, the subset of RBF transactions which we allow despite chain limits are those which
+        // conflict directly with exactly one other transaction (but may evict children of said transaction),
+        // and which are not adding any new mempool dependencies. Note that the "no new mempool dependencies"
+        // check is accomplished later, so we don't bother doing anything about it here, but if our
+        // policy changes, we may need to move that check to here instead of removing it wholesale.
+        //
+        // Such transactions are clearly not merging any existing packages, so we are only concerned with
+        // ensuring that (a) no package is growing past the package size (not count) limits and (b) we are
+        // not allowing something to effectively use the (below) carve-out spot when it shouldn't be allowed
+        // to.
+        //
+        // To check these we first check if we meet the RBF criteria, above, and increment the descendant
+        // limits by the direct conflict and its descendants (as these are recalculated in
+        // CalculateMempoolAncestors by assuming the new transaction being added is a new descendant, with no
+        // removals, of each parent's existing dependent set). The ancestor count limits are unmodified (as
+        // the ancestor limits should be the same for both our new transaction and any conflicts).
+        // We don't bother incrementing m_limit_descendants by the full removal count as that limit never comes
+        // into force here (as we're only adding a single transaction).
+        assert(ws.m_iters_conflicting.size() == 1);
+        CTxMemPool::txiter conflict = *ws.m_iters_conflicting.begin();
+
+        m_limits.descendant_count += 1;
+        m_limits.descendant_size_vbytes += conflict->GetSizeWithDescendants();
+    }
+
+    auto ancestors{m_pool.CalculateMemPoolAncestors(*entry, m_limits)};
+    if (!ancestors) {
+        // If CalculateMemPoolAncestors fails second time, we want the original error string.
+        // Contracting/payment channels CPFP carve-out:
+        // If the new transaction is relatively small (up to 40k weight)
+        // and has at most one ancestor (ie ancestor limit of 2, including
+        // the new transaction), allow it if its parent has exactly the
+        // descendant limit descendants.
+        //
+        // This allows protocols which rely on distrusting counterparties
+        // being able to broadcast descendants of an unconfirmed transaction
+        // to be secure by simply only having two immediately-spendable
+        // outputs - one for each counterparty. For more info on the uses for
+        // this, see https://lists.linuxfoundation.org/pipermail/bitcoin-dev/2018-November/016518.html
+        CTxMemPool::Limits cpfp_carve_out_limits{
+            .ancestor_count = 2,
+            .ancestor_size_vbytes = m_limits.ancestor_size_vbytes,
+            .descendant_count = m_limits.descendant_count + 1,
+            .descendant_size_vbytes = m_limits.descendant_size_vbytes + EXTRA_DESCENDANT_TX_SIZE_LIMIT,
+        };
+        const auto error_message{util::ErrorString(ancestors).original};
+        if (ws.m_vsize > EXTRA_DESCENDANT_TX_SIZE_LIMIT) {
+            return state.Invalid(TxValidationResult::TX_MEMPOOL_POLICY, "too-long-mempool-chain", error_message);
+        }
+        ancestors = m_pool.CalculateMemPoolAncestors(*entry, cpfp_carve_out_limits);
+        if (!ancestors) return state.Invalid(TxValidationResult::TX_MEMPOOL_POLICY, "too-long-mempool-chain", error_message);
+    }
+
+    ws.m_ancestors = *ancestors;
+
+    // A transaction that spends outputs that would be replaced by it is invalid. Now
+    // that we have the set of all ancestors we can detect this
+    // pathological case by making sure ws.m_conflicts and ws.m_ancestors don't
+    // intersect.
+    if (const auto err_string{EntriesAndTxidsDisjoint(ws.m_ancestors, ws.m_conflicts, hash)}) {
+        // We classify this as a consensus error because a transaction depending on something it
+        // conflicts with would be inconsistent.
+        return state.Invalid(TxValidationResult::TX_CONSENSUS, "bad-txns-spends-conflicting-tx", *err_string);
+    }
+
+    m_rbf = !ws.m_conflicts.empty();
+    return true;
+}
+
+bool MemPoolAccept::PreChecksNoLocktime(ATMPArgs& args, Workspace& ws)
+{
+    AssertLockHeld(cs_main);
+    AssertLockHeld(m_pool.cs);
+    const CTransactionRef& ptx = ws.m_ptx;
+    const CTransaction& tx = *ws.m_ptx;
+    const uint256& hash = ws.m_hash;
+
+    // Copy/alias what we need out of args
+    const int64_t nAcceptTime = args.m_accept_time;
+    const bool bypass_limits = args.m_bypass_limits;
+    std::vector<COutPoint>& coins_to_uncache = args.m_coins_to_uncache;
+
+    // Alias what we need out of ws
+    TxValidationState& state = ws.m_state;
+    std::unique_ptr<CTxMemPoolEntry>& entry = ws.m_entry;
+
+    if (!CheckTransaction(tx, state)) {
+        return false; // state filled in by CheckTransaction
+    }
+
+    // Coinbase is only valid in a block, not as a loose transaction
+    if (tx.IsCoinBase())
+        return state.Invalid(TxValidationResult::TX_CONSENSUS, "coinbase");
+
+    // Rather not work on nonstandard transactions (unless -testnet/-regtest)
+    std::string reason;
+    if (m_pool.m_require_standard && !IsStandardTx(tx, m_pool.m_max_datacarrier_bytes, m_pool.m_permit_bare_multisig, m_pool.m_dust_relay_feerate, reason)) {
+        return state.Invalid(TxValidationResult::TX_NOT_STANDARD, reason);
+    }
+
+    // Transactions smaller than 65 non-witness bytes are not relayed to mitigate CVE-2017-12842.
+    if (::GetSerializeSize(tx, PROTOCOL_VERSION | SERIALIZE_TRANSACTION_NO_WITNESS) < MIN_STANDARD_TX_NONWITNESS_SIZE)
+        return state.Invalid(TxValidationResult::TX_NOT_STANDARD, "tx-size-small");
+
+    // Only accept nLockTime-using transactions that can be mined in the next
+    // block; we don't want our mempool filled up with transactions that can't
+    // be mined yet.
+    if (!CheckFinalTxAtTipNoLocktime(*Assert(m_active_chainstate.m_chain.Tip()), tx)) {
         return state.Invalid(TxValidationResult::TX_PREMATURE_SPEND, "non-final");
     }
 
@@ -1229,6 +1519,39 @@ MempoolAcceptResult MemPoolAccept::AcceptSingleTransaction(const CTransactionRef
                                         effective_feerate, single_wtxid);
 }
 
+MempoolAcceptResult MemPoolAccept::AcceptSingleTransactionNoLocktime(const CTransactionRef& ptx, ATMPArgs& args)
+{
+    AssertLockHeld(cs_main);
+    LOCK(m_pool.cs); // mempool "read lock" (held through GetMainSignals().TransactionAddedToMempool())
+
+    Workspace ws(ptx);
+
+    if (!PreChecksNoLocktime(args, ws)) return MempoolAcceptResult::Failure(ws.m_state);
+
+    if (m_rbf && !ReplacementChecks(ws)) return MempoolAcceptResult::Failure(ws.m_state);
+
+    // Perform the inexpensive checks first and avoid hashing and signature verification unless
+    // those checks pass, to mitigate CPU exhaustion denial-of-service attacks.
+    if (!PolicyScriptChecks(args, ws)) return MempoolAcceptResult::Failure(ws.m_state);
+
+    if (!ConsensusScriptChecks(args, ws)) return MempoolAcceptResult::Failure(ws.m_state);
+
+    const CFeeRate effective_feerate{ws.m_modified_fees, static_cast<uint32_t>(ws.m_vsize)};
+    const std::vector<uint256> single_wtxid{ws.m_ptx->GetWitnessHash()};
+    // Tx was accepted, but not added
+    if (args.m_test_accept) {
+        return MempoolAcceptResult::Success(std::move(ws.m_replaced_transactions), ws.m_vsize,
+                                            ws.m_base_fees, effective_feerate, single_wtxid);
+    }
+
+    if (!Finalize(args, ws)) return MempoolAcceptResult::Failure(ws.m_state);
+
+    GetMainSignals().TransactionAddedToMempool(ptx, m_pool.GetAndIncrementSequence());
+
+    return MempoolAcceptResult::Success(std::move(ws.m_replaced_transactions), ws.m_vsize, ws.m_base_fees,
+                                        effective_feerate, single_wtxid);
+}
+
 PackageMempoolAcceptResult MemPoolAccept::AcceptMultipleTransactions(const std::vector<CTransactionRef>& txns, ATMPArgs& args)
 {
     AssertLockHeld(cs_main);
@@ -1248,6 +1571,95 @@ PackageMempoolAcceptResult MemPoolAccept::AcceptMultipleTransactions(const std::
     // Do all PreChecks first and fail fast to avoid running expensive script checks when unnecessary.
     for (Workspace& ws : workspaces) {
         if (!PreChecks(args, ws)) {
+            package_state.Invalid(PackageValidationResult::PCKG_TX, "transaction failed");
+            // Exit early to avoid doing pointless work. Update the failed tx result; the rest are unfinished.
+            results.emplace(ws.m_ptx->GetWitnessHash(), MempoolAcceptResult::Failure(ws.m_state));
+            return PackageMempoolAcceptResult(package_state, std::move(results));
+        }
+        // Make the coins created by this transaction available for subsequent transactions in the
+        // package to spend. Since we already checked conflicts in the package and we don't allow
+        // replacements, we don't need to track the coins spent. Note that this logic will need to be
+        // updated if package replace-by-fee is allowed in the future.
+        assert(!args.m_allow_replacement);
+        m_viewmempool.PackageAddTransaction(ws.m_ptx);
+    }
+
+    // Transactions must meet two minimum feerates: the mempool minimum fee and min relay fee.
+    // For transactions consisting of exactly one child and its parents, it suffices to use the
+    // package feerate (total modified fees / total virtual size) to check this requirement.
+    const auto m_total_vsize = std::accumulate(workspaces.cbegin(), workspaces.cend(), int64_t{0},
+        [](int64_t sum, auto& ws) { return sum + ws.m_vsize; });
+    const auto m_total_modified_fees = std::accumulate(workspaces.cbegin(), workspaces.cend(), CAmount{0},
+        [](CAmount sum, auto& ws) { return sum + ws.m_modified_fees; });
+    const CFeeRate package_feerate(m_total_modified_fees, m_total_vsize);
+    TxValidationState placeholder_state;
+    if (args.m_package_feerates &&
+        !CheckFeeRate(m_total_vsize, m_total_modified_fees, placeholder_state)) {
+        package_state.Invalid(PackageValidationResult::PCKG_POLICY, "package-fee-too-low");
+        return PackageMempoolAcceptResult(package_state, {});
+    }
+
+    // Apply package mempool ancestor/descendant limits. Skip if there is only one transaction,
+    // because it's unnecessary. Also, CPFP carve out can increase the limit for individual
+    // transactions, but this exemption is not extended to packages in CheckPackageLimits().
+    std::string err_string;
+    if (txns.size() > 1 && !PackageMempoolChecks(txns, package_state)) {
+        return PackageMempoolAcceptResult(package_state, std::move(results));
+    }
+
+    std::vector<uint256> all_package_wtxids;
+    all_package_wtxids.reserve(workspaces.size());
+    std::transform(workspaces.cbegin(), workspaces.cend(), std::back_inserter(all_package_wtxids),
+                   [](const auto& ws) { return ws.m_ptx->GetWitnessHash(); });
+    for (Workspace& ws : workspaces) {
+        ws.m_package_feerate = package_feerate;
+        if (!PolicyScriptChecks(args, ws)) {
+            // Exit early to avoid doing pointless work. Update the failed tx result; the rest are unfinished.
+            package_state.Invalid(PackageValidationResult::PCKG_TX, "transaction failed");
+            results.emplace(ws.m_ptx->GetWitnessHash(), MempoolAcceptResult::Failure(ws.m_state));
+            return PackageMempoolAcceptResult(package_state, std::move(results));
+        }
+        if (args.m_test_accept) {
+            const auto effective_feerate = args.m_package_feerates ? ws.m_package_feerate :
+                CFeeRate{ws.m_modified_fees, static_cast<uint32_t>(ws.m_vsize)};
+            const auto effective_feerate_wtxids = args.m_package_feerates ? all_package_wtxids :
+                std::vector<uint256>{ws.m_ptx->GetWitnessHash()};
+            results.emplace(ws.m_ptx->GetWitnessHash(),
+                            MempoolAcceptResult::Success(std::move(ws.m_replaced_transactions),
+                                                         ws.m_vsize, ws.m_base_fees, effective_feerate,
+                                                         effective_feerate_wtxids));
+        }
+    }
+
+    if (args.m_test_accept) return PackageMempoolAcceptResult(package_state, std::move(results));
+
+    if (!SubmitPackage(args, workspaces, package_state, results)) {
+        // PackageValidationState filled in by SubmitPackage().
+        return PackageMempoolAcceptResult(package_state, std::move(results));
+    }
+
+    return PackageMempoolAcceptResult(package_state, std::move(results));
+}
+
+PackageMempoolAcceptResult MemPoolAccept::AcceptMultipleTransactionsNoLocktime(const std::vector<CTransactionRef>& txns, ATMPArgs& args)
+{
+    AssertLockHeld(cs_main);
+
+    // These context-free package limits can be done before taking the mempool lock.
+    PackageValidationState package_state;
+    if (!CheckPackage(txns, package_state)) return PackageMempoolAcceptResult(package_state, {});
+
+    std::vector<Workspace> workspaces{};
+    workspaces.reserve(txns.size());
+    std::transform(txns.cbegin(), txns.cend(), std::back_inserter(workspaces),
+                   [](const auto& tx) { return Workspace(tx); });
+    std::map<const uint256, const MempoolAcceptResult> results;
+
+    LOCK(m_pool.cs);
+
+    // Do all PreChecks first and fail fast to avoid running expensive script checks when unnecessary.
+    for (Workspace& ws : workspaces) {
+        if (!PreChecksNoLocktime(args, ws)) {
             package_state.Invalid(PackageValidationResult::PCKG_TX, "transaction failed");
             // Exit early to avoid doing pointless work. Update the failed tx result; the rest are unfinished.
             results.emplace(ws.m_ptx->GetWitnessHash(), MempoolAcceptResult::Failure(ws.m_state));
@@ -1506,6 +1918,33 @@ MempoolAcceptResult AcceptToMemoryPool(Chainstate& active_chainstate, const CTra
     return result;
 }
 
+MempoolAcceptResult AcceptToMemoryPoolNoLocktime(Chainstate& active_chainstate, const CTransactionRef& tx,
+                                       int64_t accept_time, bool bypass_limits, bool test_accept)
+    EXCLUSIVE_LOCKS_REQUIRED(::cs_main)
+{
+    AssertLockHeld(::cs_main);
+    const CChainParams& chainparams{active_chainstate.m_chainman.GetParams()};
+    assert(active_chainstate.GetMempool() != nullptr);
+    CTxMemPool& pool{*active_chainstate.GetMempool()};
+
+    std::vector<COutPoint> coins_to_uncache;
+    auto args = MemPoolAccept::ATMPArgs::SingleAccept(chainparams, accept_time, bypass_limits, coins_to_uncache, test_accept);
+    MempoolAcceptResult result = MemPoolAccept(pool, active_chainstate).AcceptSingleTransactionNoLocktime(tx, args);
+    if (result.m_result_type != MempoolAcceptResult::ResultType::VALID) {
+        // Remove coins that were not present in the coins cache before calling
+        // AcceptSingleTransaction(); this is to prevent memory DoS in case we receive a large
+        // number of invalid transactions that attempt to overrun the in-memory coins cache
+        // (`CCoinsViewCache::cacheCoins`).
+
+        for (const COutPoint& hashTx : coins_to_uncache)
+            active_chainstate.CoinsTip().Uncache(hashTx);
+    }
+    // After we've (potentially) uncached entries, ensure our coins cache is still within its size limits
+    BlockValidationState state_dummy;
+    active_chainstate.FlushStateToDisk(state_dummy, FlushStateMode::PERIODIC);
+    return result;
+}
+
 PackageMempoolAcceptResult ProcessNewPackage(Chainstate& active_chainstate, CTxMemPool& pool,
                                                    const Package& package, bool test_accept)
 {
@@ -1520,6 +1959,38 @@ PackageMempoolAcceptResult ProcessNewPackage(Chainstate& active_chainstate, CTxM
         if (test_accept) {
             auto args = MemPoolAccept::ATMPArgs::PackageTestAccept(chainparams, GetTime(), coins_to_uncache);
             return MemPoolAccept(pool, active_chainstate).AcceptMultipleTransactions(package, args);
+        } else {
+            auto args = MemPoolAccept::ATMPArgs::PackageChildWithParents(chainparams, GetTime(), coins_to_uncache);
+            return MemPoolAccept(pool, active_chainstate).AcceptPackage(package, args);
+        }
+    }();
+
+    // Uncache coins pertaining to transactions that were not submitted to the mempool.
+    if (test_accept || result.m_state.IsInvalid()) {
+        for (const COutPoint& hashTx : coins_to_uncache) {
+            active_chainstate.CoinsTip().Uncache(hashTx);
+        }
+    }
+    // Ensure the coins cache is still within limits.
+    BlockValidationState state_dummy;
+    active_chainstate.FlushStateToDisk(state_dummy, FlushStateMode::PERIODIC);
+    return result;
+}
+
+PackageMempoolAcceptResult ProcessNewPackageNoLocktime(Chainstate& active_chainstate, CTxMemPool& pool,
+                                                   const Package& package, bool test_accept)
+{
+    AssertLockHeld(cs_main);
+    assert(!package.empty());
+    assert(std::all_of(package.cbegin(), package.cend(), [](const auto& tx){return tx != nullptr;}));
+
+    std::vector<COutPoint> coins_to_uncache;
+    const CChainParams& chainparams = active_chainstate.m_chainman.GetParams();
+    auto result = [&]() EXCLUSIVE_LOCKS_REQUIRED(cs_main) {
+        AssertLockHeld(cs_main);
+        if (test_accept) {
+            auto args = MemPoolAccept::ATMPArgs::PackageTestAccept(chainparams, GetTime(), coins_to_uncache);
+            return MemPoolAccept(pool, active_chainstate).AcceptMultipleTransactionsNoLocktime(package, args);
         } else {
             auto args = MemPoolAccept::ATMPArgs::PackageChildWithParents(chainparams, GetTime(), coins_to_uncache);
             return MemPoolAccept(pool, active_chainstate).AcceptPackage(package, args);
@@ -4054,6 +4525,20 @@ MempoolAcceptResult ChainstateManager::ProcessTransaction(const CTransactionRef&
         return MempoolAcceptResult::Failure(state);
     }
     auto result = AcceptToMemoryPool(active_chainstate, tx, GetTime(), /*bypass_limits=*/ false, test_accept);
+    active_chainstate.GetMempool()->check(active_chainstate.CoinsTip(), active_chainstate.m_chain.Height() + 1);
+    return result;
+}
+
+MempoolAcceptResult ChainstateManager::ProcessTransactionNoLocktime(const CTransactionRef& tx, bool test_accept)
+{
+    AssertLockHeld(cs_main);
+    Chainstate& active_chainstate = ActiveChainstate();
+    if (!active_chainstate.GetMempool()) {
+        TxValidationState state;
+        state.Invalid(TxValidationResult::TX_NO_MEMPOOL, "no-mempool");
+        return MempoolAcceptResult::Failure(state);
+    }
+    auto result = AcceptToMemoryPoolNoLocktime(active_chainstate, tx, GetTime(), /*bypass_limits=*/ false, test_accept);
     active_chainstate.GetMempool()->check(active_chainstate.CoinsTip(), active_chainstate.m_chain.Height() + 1);
     return result;
 }
